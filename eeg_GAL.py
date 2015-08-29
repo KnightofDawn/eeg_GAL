@@ -5,6 +5,7 @@ import pdb
 import re
 import cPickle
 import datetime
+import collections
 
 import pandas as pd
 from scipy.io import loadmat
@@ -297,14 +298,12 @@ class GAL_data():
         assert input_dim == self.eeg_dict[self.eeg_dict.keys()[0]].shape[1], 'input dim doesn\'t match'
 
         self.data_description['participator'] = part
+        self.data_description['timesteps'] = timesteps
+        self.data_description['stride'] = stride
+        self.data_description['event_list'] = event_list
+        if event_range != None:
+            self.data_description['event_range'] = event_range
 
-        for key in self.data_description.keys():
-            if self.data_description[key] == None:
-                self.data_description['timesteps'] = timesteps
-                self.data_description['stride'] = stride
-                self.data_description['event_list'] = event_list
-            if event_range != None:
-                self.data_description['event_range'] = event_range
 
         part_list = [x for x in self.eeg_dict.keys() if x[0] == part]
         for key in part_list:
@@ -327,18 +326,20 @@ class GAL_data():
                 bothdigittouch = int(self.info_dict[key]['tBothDigitTouch'].values / 0.002)
                 bothstartload = int(self.info_dict[key]['tBothStartLoadPhase'].values / 0.002)
                 liftoff = int(self.info_dict[key]['tLiftOff'].values / 0.002)
+                maxGF = int(self.info_dict[key]['tGF_Max'].values / 0.002)
+                LEDOff = int(self.info_dict[key]['LEDOff'].values / 0.002)
                 replace = int(self.info_dict[key]['tReplace'].values / 0.002)
                 bothreleased = int(self.info_dict[key]['tBothReleased'].values / 0.002)
                 handstop = int(self.info_dict[key]['tHandStop'].values / 0.002)
 
                 y[handstart:bothdigittouch, event_list.index('Dur_Reach')] = 1
                 #y[bothdigittouch:bothstartload, event_list.index('Dur_Preload')] = 1
-                y[bothdigittouch:liftoff, event_list.index('Dur_LoadPhase')] = 1
-                '''
-                Dur_LoadPhase is different from the definition of the original paper
-                '''
-                y[replace:bothreleased, event_list.index('Dur_Release')] = 1
-                y[bothreleased:handstop, event_list.index('Dur_Withdraw')] = 1
+                y[bothdigittouch:maxGF, event_list.index('Dur_LoadReach')] = 1
+                y[maxGF:LEDOff, event_list.index('Dur_LoadMaintain')] = 1
+                y[LEDOff:replace, event_list.index('Dur_LoadRetract')] = 1
+                #y[replace:bothreleased, event_list.index('Dur_Release')] = 1
+                y[replace:handstop, event_list.index('Dur_Retract')] = 1
+                # TODO fix the DurMaintain and LoadReach by using the x,y,z coordinates information
 
             X = X.astype('float32')
             y = y.astype('float32')
@@ -403,6 +404,18 @@ class EEG_rnn_batch():
             model.compile(loss='binary_crossentropy', optimizer='adadelta', class_mode='binary')
             return model
 
+        def lstm_3():
+            model = Sequential()
+            model.add(LSTM(input_dim=32, output_dim=64, return_sequences=True)) # try using a GRU instead, for fun
+            model.add(LSTM(input_dim=64, output_dim=64, return_sequences=False))
+            model.add(Dropout(0.0))
+            model.add(Dense(64, 128))
+            model.add(Dropout(0.0))
+            model.add(Dense(128, len(self.event_list)))
+            model.add(Activation('sigmoid'))
+            model.compile(loss='binary_crossentropy', optimizer='adadelta', class_mode='binary')
+            return model
+
         def simple_rnn_1():
             model = Sequential()
             model.add(SimpleDeepRNN(input_dim=32, output_dim=64)) # try using a GRU instead, for fun
@@ -416,6 +429,7 @@ class EEG_rnn_batch():
         self.model = eval('{0}()'.format(model_name))
         self.model_config['model'] = model_name
         self.logger.info('selected model {0}'.format(model_name))
+        self.model_config['dropout'] = [0.0,0.0]
 
     def load_model_weight(self, model_name, folder_name):
         self.model.load_weights(os.path.join('output', folder_name, 'weight.hdf'))
@@ -486,93 +500,11 @@ class EEG_rnn_batch():
     def save_score_model(self, generator, train_list, validate_list, test_list, event_list, output_dir):
         assert self.data_description != None, 'data_description is not set'
 
-        def evaluate_score(self, data_list, data_type, param_threshold = None, generator=generator, event_list=event_list, output_dir = output_dir):
-            start = time.clock()
-            self.logger.info('predicting values : {0}'.format(data_type))
-
-            pred = None
-            pred_binary = None
-            for _ in data_list:
-                X , y_temp = generator.next()
-                if pred == None:
-                    pred = self.model.predict(X)
-                    pred_binary = np.zeros(shape = y_temp.shape)
-                    y = y_temp
-                else:
-                    pred = np.vstack((pred, self.model.predict(X)))
-                    pred_binary = np.vstack((pred_binary, np.zeros(shape = y_temp.shape)))
-                    y = np.vstack((y, y_temp))
-
-            if data_type == 'validate':
-                threshold_list = np.arange(0.5, 0.01, -0.01)
-            elif data_type == 'test' or data_type == 'train':
-                threshold_list = [param_threshold]
-
-            max_mean_f1 = 0
-            max_f1_score = 0
-            param_threshold = 1
-
-            if data_type == 'validate':
-                multi_index = pd.MultiIndex.from_product([threshold_list, self.event_list], names = ['threshold', 'event'])
-                df_score_all = pd.DataFrame(index = multi_index)
-                score_name_list = ['f1_score', 'precision_score', 'recall_score']
-            elif data_type == 'test' or data_type == 'train':
-                df_score_all = None
-
-            nb_classes = len(event_list)
-
-            for threshold in threshold_list:
-                for i in range(pred.shape[0]):
-                    for j in range(pred.shape[1]):
-                        if pred[i, j] >= threshold:
-                            pred_binary[i, j] = 1
-                f1_score = [sklearn.metrics.f1_score(y[:, i], pred_binary[:, i]) for i in range(nb_classes)]
-                mean_f1 = np.mean(f1_score)
-                f1_score = sklearn.metrics.f1_score(y[:, k], pred_binary[:, k])
-
-                if data_type =='validate':
-                    precision_score = [sklearn.metrics.precision_score(y[:, i], pred_binary[:, i]) for i in range(nb_classes)]
-                    recall_score = [sklearn.metrics.recall_score(y[:, i], pred_binary[:, i]) for i in range(nb_classes)]
-                    score_list = [f1_score, precision_score, recall_score]
-
-                    for score, col in zip(score_name_list, range(len(score_name_list))):
-                        df_score_all.loc[(threshold,), score] = score_list[col]
-
-                if mean_f1 > max_mean_f1:
-                    max_mean_f1 = mean_f1
-                    max_f1_score = f1_score
-                    param_threshold = threshold
-                    max_precision_score = [sklearn.metrics.precision_score(y[:, i], pred_binary[:, i]) for i in range(nb_classes)]
-                    max_recall_score = [sklearn.metrics.recall_score(y[:, i], pred_binary[:, i]) for i in range(nb_classes)]
-
-            #precision, recall, thresholds = [sklearn.metrics.precision_recall_curve(y[:, i], pred[:,i]) for i in range(nb_classes)]
-
-            auc_score = [roc_auc_score(y[:, i], pred[:, i]) for i in range(nb_classes)]
-
-            score_list = [max_f1_score, max_precision_score, max_recall_score, auc_score]
-
-            self.logger.info( ('time elapsed : {0} seconds'.format(time.clock() - start)))
-
-            if data_type == 'validate':
-                self.logger.info((data_type+' threshold : ', param_threshold))
-                self.logger.info( (data_type+' auc : ', np.mean(auc_score)))
-                self.logger.info( (data_type+' f1 : ', np.mean(max_f1_score)))
-                self.logger.info( (data_type+' precision : ', np.mean(max_precision_score)))
-                self.logger.info( (data_type+' recall : ', np.mean(max_recall_score)))
-            else:
-                self.logger.info( (data_type+' auc : ', np.mean(auc_score)))
-                self.logger.info( (data_type+' f1 : ', np.mean(max_f1_score)))
-                self.logger.info( (data_type+' precision : ', np.mean(max_precision_score)))
-                self.logger.info( (data_type+' recall : ', np.mean(max_recall_score)))
-
-            return score_list, param_threshold, df_score_all, pred, pred_binary
-
         def evaluate_score_revised(self, data_list, data_type, param_threshold_list = None, generator=generator, event_list=event_list, output_dir = output_dir):
             start = time.clock()
             self.logger.info('predicting values : {0}'.format(data_type))
 
             pred = None
-            pred_binary = None
             for _ in data_list:
                 X , y_temp = generator.next()
                 if pred == None:
@@ -658,6 +590,7 @@ class EEG_rnn_batch():
 
         self.model.save_weights(os.path.join(output_dir, 'weight.hdf'))
 
+        self.model_config['threshold'] = param_threshold_list
         with open(os.path.join(output_dir, 'data_description.txt'), 'w') as f:
             for key in self.data_description.keys():
                 f.write('{0} : {1}\n'.format(key, self.data_description[key]))
@@ -666,6 +599,8 @@ class EEG_rnn_batch():
 
         with open(os.path.join(output_dir, 'model_config.txt'), 'w') as f:
             for key in self.model_config.keys():
+                if isinstance(self.model_config[key], collections.Iterable) and not isinstance(self.model_config[key], basestring):
+                    self.model_config[key] = ', '.join([str(i) for i in self.model_config[key]])
                 f.write('{0} : {1}\n'.format(key, self.model_config[key]))
         self.logger.info('model_config.txt saved')
 
@@ -677,7 +612,6 @@ class EEG_rnn_batch():
 
     def set_logger(self, logger):
         self.logger = logger
-
 
 def read_save_raw():
     gal = GAL_data()
@@ -696,7 +630,6 @@ def legacy():
     event_list = ['tHandStart', 'tFirstDigitTouch', 'tBothStartLoadPhase', 'tLiftOff', 'tReplace', 'tBothReleased', 'tHandStop']
     gal.make_agg_X_y(timesteps=500, stride=1, event_list=event_list, event_range=np.arange(-75, 75))
     gal.save_X_y()
-
 
 def run_model_event_range(model_name, participator, timesteps, stride, nb_epoch, event_range, load_weight_from = None):
     logger = logging.getLogger()
@@ -745,7 +678,8 @@ def run_model_event_range(model_name, participator, timesteps, stride, nb_epoch,
     rnn.save_score_model(generator=generator,train_list=train_list, validate_list=validate_list,test_list=test_list, event_list=event_list, output_dir=output_dir)
 
 def run_model_duration(model_name, participator, timesteps, stride, nb_epoch, load_weight_from = None):
-    logger = logging.getLogger()
+    logger_name = model_name + str(participator) + str(timesteps) + str(stride) + str(nb_epoch) + str(load_weight_from)
+    logger = logging.getLogger(logger_name) # so that no multiple loggers input the same data
     f_time = datetime.datetime.today()
     output_dir = os.path.join('output', str(f_time))
     if not os.path.exists(output_dir):
@@ -761,8 +695,8 @@ def run_model_duration(model_name, participator, timesteps, stride, nb_epoch, lo
     data_description = gal.get_data_description()
     participator = participator
     logger.info('participator : {0}'.format(participator))
-    #event_list=['Dur_Reach', 'Dur_Preload', 'Dur_LoadPhase', 'Dur_Release', 'Dur_Withdraw']
-    event_list=['Dur_Reach', 'Dur_LoadPhase', 'Dur_Release', 'Dur_Withdraw']
+    #event_list=['Dur_Reach', 'Dur_Preload', 'Dur_LoadPhase', 'Dur_Release', 'Dur_Retract']
+    event_list=['Dur_Reach', 'Dur_LoadReach', 'Dur_LoadMaintain', 'Dur_LoadRetract', 'Dur_Retract']
 
     rnn = EEG_rnn_batch(event_list)
     rnn.set_logger(logger)
@@ -792,9 +726,13 @@ def run_model_duration(model_name, participator, timesteps, stride, nb_epoch, lo
     rnn.save_score_model(generator=generator,train_list=train_list, validate_list=validate_list,test_list=test_list, event_list=event_list, output_dir=output_dir)
 
 if __name__ == '__main__':
-#    run_model(model_name='lstm_1', participator=1, timesteps=100, stride=1, nb_epoch=50, load_weight_from = '2015-08-24 21:10:33.270834')
-#    run_model(model_name='lstm_1', participator = 1, timesteps=30, stride=1, nb_epoch=50)
-#    for i in np.arange(11) + 2:
-#        run_model(model_name='lstm_1', participator=i, timesteps=50, stride=1, nb_epoch=50)
-#    run_model_duration(model_name='lstm_1', participator=1, timesteps=500, stride=100, nb_epoch=20, event_range=np.arange(-75, 75))
-    run_model_duration(model_name='lstm_2', participator=1, timesteps=100, stride=1, nb_epoch=1, load_weight_from='2015-08-28 16:40:02.798964')
+
+    #run_model_duration(model_name='lstm_3', participator=1, timesteps=10, stride=1, nb_epoch=100)
+    #run_model_duration(model_name='lstm_3', participator=1, timesteps=20, stride=1, nb_epoch=100)
+    #run_model_duration(model_name='lstm_3', participator=1, timesteps=30, stride=1, nb_epoch=100)
+    #run_model_duration(model_name='lstm_3', participator=1, timesteps=40, stride=1, nb_epoch=100)
+    run_model_duration(model_name='lstm_3', participator=1, timesteps=50, stride=1, nb_epoch=100)
+    run_model_duration(model_name='lstm_3', participator=1, timesteps=100, stride=1, nb_epoch=100)
+    run_model_duration(model_name='lstm_3', participator=1, timesteps=150, stride=1, nb_epoch=100)
+    #run_model_duration(model_name='lstm_3', participator=1, timesteps=1, stride=1, nb_epoch=50)
+    #run_model_duration(model_name='lstm_3', participator=1, timesteps=100, stride=1, nb_epoch=50)
