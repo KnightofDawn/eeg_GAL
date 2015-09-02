@@ -465,27 +465,27 @@ class GAL_data():
             # nb_samples = (self.trial_length - timesteps) / stride + 1
             trial_step_size = self.eeg_dict[key].shape[0]
             nb_samples = (trial_step_size - timesteps) / stride + 1
+
+            columns = ['Px2 - position x sensor 2',
+                    'Px3 - position x sensor 3',
+                    'Px4 - position x sensor 4',
+                    'Py2 - position y sensor 2',
+                    'Py3 - position y sensor 3',
+                    'Py4 - position y sensor 4',
+                    'Pz2 - position z sensor 2',
+                    'Pz3 - position z sensor 3',
+                    'Pz4 - position z sensor 4']
+
             X = np.zeros((nb_samples, timesteps, input_dim))
-            y = np.zeros((nb_samples, timesteps, 12))
+            y = np.zeros((nb_samples, timesteps, len(columns)))
 
             temp_eeg = self.eeg_dict[key]
             temp_kin = self.kin_dict[key]
 
             for i in np.arange(nb_samples):
                 X[i,:,:] = temp_eeg[i*stride:i*stride+timesteps,:]
-                y[i,:,:] = temp_kin.loc[i*stride:i*stride+timesteps-1,['Px2 - position x sensor 2',
-                                                                'Px3 - position x sensor 3',
-                                                                'Px4 - position x sensor 4',
-                                                                'Py2 - position y sensor 2',
-                                                                'Py3 - position y sensor 3',
-                                                                'Py4 - position y sensor 4',
-                                                                'Pz2 - position z sensor 2',
-                                                                'Pz3 - position z sensor 3',
-                                                                'Pz4 - position z sensor 4']]
-
-
+                y[i,:,:] = temp_kin.loc[i*stride:i*stride+timesteps-1,columns]
                                 ## pandas include to end index so I excluded it
-
 
             X = X.astype('float32')
             y = y.astype('float32')
@@ -579,6 +579,16 @@ class EEG_rnn_batch():
             model.add(Activation('relu'))
             model.add(Dropout(0.0))
             model.add(TimeDistributedDense(128,12))
+            model.add(Activation('linear'))
+            model.compile(loss='mean_squared_error', optimizer='adadelta')
+            return model
+
+        def seq_to_seq():
+            self.model_config['dropout'] = [0.0, 0.0]
+            model = Sequential()
+            model.add(LSTM(input_dim=32, output_dim=32, return_sequences=True))
+            model.add(Dropout(0.0))
+            model.add(TimeDistributedDense(32,9))# output shape: (nb_samples, nb_timesteps, 9)
             model.add(Activation('linear'))
             model.compile(loss='mean_squared_error', optimizer='adadelta')
             return model
@@ -685,9 +695,11 @@ class EEG_rnn_batch():
                 loss_total = loss_total + loss
                 print( '{0} : complete {1:.2f}%,  loss : {2}'.format(data_type, float(i+1)/len(data_list) * 100, loss_total/(i+1)), end = '\r')
             self.logger.info( '{0} : complete {1:.2f}%,  loss : {2}'.format(data_type, float(i+1)/len(data_list) * 100, loss_total/(i+1)))
+            return loss_total / len(data_list)
 
-        run(data_list=train_list, data_type = 'train')
-        run(data_list=test_list, data_type= 'test')
+        train_loss = run(data_list=train_list, data_type = 'train')
+        test_loss = run(data_list=test_list, data_type= 'test')
+        return train_loss
 
     def save_score_model(self, generator, train_list, validate_list, test_list, event_list, output_dir):
         assert self.data_description != None, 'data_description is not set'
@@ -942,7 +954,7 @@ def run_model_duration_generator(model_name, participator, timesteps, stride, nb
 
     rnn.save_score_model(generator=generator,train_list=train_list, validate_list=validate_list,test_list=test_list, event_list=event_list, output_dir=output_dir)
 
-def run_model_kin_generator(model_name, participator, timesteps, stride, nb_epoch, load_weight_from = None):
+def run_model_kin_generator(model_name, participator, timesteps, stride, nb_epoch, patience_limit, loss_delta_limit, load_weight_from = None):
     logger_name = model_name + str(participator) + str(timesteps) + str(stride) + str(nb_epoch) + str(load_weight_from)
     logger = logging.getLogger(logger_name) # so that no multiple loggers input the same data
     f_time = datetime.datetime.today()
@@ -974,12 +986,23 @@ def run_model_kin_generator(model_name, participator, timesteps, stride, nb_epoc
 
     test_list = np.arange(data_len - int(data_len * data_split_ratio[0]))
 
+    patience = 0
     for epoch in range(nb_epoch):
         generator = gal.data_generator_kin(part=participator, timesteps=timesteps, stride=stride)
         logger.info( 'epoch : {0}'.format(epoch))
         start = time.clock()
-        rnn.run_model_with_generator_kin(generator=generator, train_list=train_list, test_list=test_list)
+        train_loss = rnn.run_model_with_generator_kin(generator=generator, train_list=train_list, test_list=test_list)
+        if epoch == 0:
+            prev_train_loss = train_loss
         logger.info( 'epoch {0} ran for {1} minutes'.format(epoch, (time.clock() - start)/60))
+        loss_delta = abs(prev_train_loss - train_loss) / prev_train_loss * 100
+        if loss_delta < loss_delta_limit:
+            patience = patience + 1
+            if patience > patience_limit:
+                logger.info('training stopped at epoch {0} due to patience threshold'.format(epoch))
+                break
+        else:
+            patience = patience - 1
 
 
     rnn.set_data_description(data_description)

@@ -3,6 +3,8 @@ import re
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
 __author__ = 'jinwon'
 
 from matplotlib import pyplot
@@ -12,8 +14,8 @@ from matplotlib import pyplot
 class Visualizer():
 
     def __init__(self):
-        self.X = None
-        self.y = None
+        self.predict = None
+        self.true = None
         self.col_name = ['Px1', 'Px2', 'Px3', 'Px4', 'Py1', 'Py2', 'Py3', 'Py4', 'Pz1', 'Pz2', 'Pz3', 'Pz4']
         self.data_type = None
         self.data_description = dict()
@@ -23,39 +25,39 @@ class Visualizer():
 
     def load_data(self, load_dir, data_type):
         print 'loading files'
-        X = dict()
-        y = dict()
+        predict = dict()
+        true = dict()
         self.data_type = data_type
         for dirpath, directory, files in os.walk(os.path.join(load_dir, data_type)):
             for filename in files:
                 match_pred = re.match('train_(.+,.+,.+)_pred\.npy', filename)
                 if match_pred != None:
                     key = match_pred.groups()
-                    X[key] = np.load(os.path.join(dirpath, filename))
+                    predict[key] = np.load(os.path.join(dirpath, filename))
 
 
                 match_true = re.match('train_(.+,.+,.+)_true.npy', filename)
                 if match_true != None:
                     key = match_true.groups()
-                    y[key] = np.load(os.path.join(dirpath, filename))
+                    true[key] = np.load(os.path.join(dirpath, filename))
 
         with open(os.path.join(load_dir, 'data_description.txt')) as f:
             for line in f.readlines():
                 key, val = re.match('(.*) : (.*)', line).groups()
                 self.data_description[key] = val
 
-        self.X = X
-        self.y = y
+        self.predict = predict
+        self.true = true
 
 
 
 
-    def make_plot(self, sensor_id=None):
-        print 'start ploting'
+    def plot_2d(self, sensor_id=None):
+        print 'start 2d ploting'
         stride = int(self.data_description['stride'])
-        for key in self.X.keys():
-            X = self.X[key]
-            y = self.y[key]
+        for key in self.predict.keys():
+            X = self.predict[key]
+            y = self.true[key]
             window = np.arange(X.shape[1])
             window_size = X.shape[1]
             if sensor_id == None:
@@ -74,14 +76,38 @@ class Visualizer():
                     if skip == 'skip':
                         break
 
+    def plot_3d(self, sensor_num=None):
+        print 'start 3d ploting'
+        stride = int(self.data_description['stride'])
+        for key in self.predict.keys():
+            predict = self.predict[key]
+            true = self.true[key]
 
-data_dir = '2015-09-01 21:27:15.623976'
+            window_size = predict.shape[1]
+            sensor_list = sorted([self.col_name.index(x) for x in self.col_name if re.match('P.{0}'.format(sensor_num),x)])
+
+            for timestep in np.arange(predict.shape[0]):
+                fig = plt.figure()
+                ax = fig.gca(projection = '3d')
+                ax.plot(predict[timestep, :, sensor_list[0]], predict[timestep,:,sensor_list[1]], predict[timestep,:,sensor_list[2]], label = 'prediction')
+                ax.plot(true[timestep,:,sensor_list[0]], true[timestep,:,sensor_list[1]], true[timestep,:,sensor_list[2]], label = 'true')
+                plt.suptitle('data : {0} sensor : P{1}'.format(key, sensor_num), fontweight = 'bold')
+                plt.title('time window from {0} to {1}'.format(stride * timestep, stride * timestep + window_size))
+                ax.set_xlabel('x')
+                ax.set_ylabel('y')
+                ax.set_zlabel('z')
+
+                plt.legend(loc = 'upper right')
+                plt.show()
+
+
+data_dir = '2015-09-02 07:38:10.474885'
 load_dir = os.path.join('output', data_dir)
 
 vis = Visualizer()
-sensor_id = ['Px1', 'Py1', 'Pz1']
+sensor_num = '2'
 vis.load_data(load_dir = load_dir, data_type='train')
-vis.make_plot(sensor_id = sensor_id)
+vis.plot_3d(sensor_num= sensor_num)
 
 
 
