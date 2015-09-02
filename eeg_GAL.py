@@ -473,15 +473,12 @@ class GAL_data():
 
             for i in np.arange(nb_samples):
                 X[i,:,:] = temp_eeg[i*stride:i*stride+timesteps,:]
-                y[i,:,:] = temp_kin.loc[i*stride:i*stride+timesteps-1,['Px1 - position x sensor 1',
-                                                                'Px2 - position x sensor 2',
+                y[i,:,:] = temp_kin.loc[i*stride:i*stride+timesteps-1,['Px2 - position x sensor 2',
                                                                 'Px3 - position x sensor 3',
                                                                 'Px4 - position x sensor 4',
-                                                                'Py1 - position y sensor 1',
                                                                 'Py2 - position y sensor 2',
                                                                 'Py3 - position y sensor 3',
                                                                 'Py4 - position y sensor 4',
-                                                                'Pz1 - position z sensor 1',
                                                                 'Pz2 - position z sensor 2',
                                                                 'Pz3 - position z sensor 3',
                                                                 'Pz4 - position z sensor 4']]
@@ -573,6 +570,7 @@ class EEG_rnn_batch():
             return model
 
         def seq_to_seq():
+            self.model_config['dropout'] = [0.0, 0.0]
             model = Sequential()
             model.add(LSTM(input_dim=32, output_dim=64, return_sequences=True))
             model.add(LSTM(input_dim=64, output_dim=64, return_sequences=True))
@@ -800,7 +798,23 @@ class EEG_rnn_batch():
 
     def save_predict_model(self, generator, train_list, test_list, output_dir):
 
+        self.model.save_weights(os.path.join(output_dir, 'weight.hdf'))
+
+        with open(os.path.join(output_dir, 'data_description.txt'), 'w') as f:
+            for key in self.data_description.keys():
+                f.write('{0} : {1}\n'.format(key, self.data_description[key]))
+
+        self.logger.info('data_description.txt saved')
+
+        with open(os.path.join(output_dir, 'model_config.txt'), 'w') as f:
+            for key in self.model_config.keys():
+                if isinstance(self.model_config[key], collections.Iterable) and not isinstance(self.model_config[key], basestring):
+                    self.model_config[key] = ', '.join([str(i) for i in self.model_config[key]])
+                f.write('{0} : {1}\n'.format(key, self.model_config[key]))
+        self.logger.info('model_config.txt saved')
+
         self.logger.info('predicted model output')
+
         def save_prediction(data_list, data_type, generator=generator):
             if not os.path.exists(os.path.join(output_dir, data_type)):
                 os.makedirs(os.path.join(output_dir, data_type))
@@ -808,9 +822,8 @@ class EEG_rnn_batch():
             save_dir = os.path.join(output_dir, data_type)
             for _ in data_list:
                 X, y, key = generator.next()
-                predict = self.model.predict(X)
-                np.savetxt(os.path.join(save_dir, '{0}_{1}_pred.csv'.format(data_type, key)), predict.reshape(predict.shape[0], -1), delimiter=',')
-                np.savetxt(os.path.join(save_dir, '{0}_{1}_true.csv'.format(data_type, key)), np.asarray(y.reshape(y.shape[0], -1)), delimiter=',')
+                np.save(os.path.join(save_dir, '{0}_{1}_pred'.format(data_type, key)), self.model.predict(X))
+                np.save(os.path.join(save_dir, '{0}_{1}_true'.format(data_type, key)), np.asarray(y))
 
         save_prediction(train_list, 'train')
         save_prediction(test_list, 'test')
@@ -971,7 +984,7 @@ def run_model_kin_generator(model_name, participator, timesteps, stride, nb_epoc
 
     rnn.set_data_description(data_description)
     rnn.set_model_config('epoch', nb_epoch)
-    generator = gal.data_generator_kin(part=participator, timesteps=timesteps, stride=stride)
+    generator = gal.data_generator_kin(part=participator, timesteps=timesteps, stride = stride)
 
     rnn.save_predict_model(generator=generator,train_list=train_list, test_list=test_list, output_dir=output_dir)
 
@@ -1014,13 +1027,44 @@ def run_model_kin(model_name, participator, timesteps, stride, nb_epoch, load_we
     generator = gal.data_generator_kin(part=participator, timesteps=timesteps, stride=stride)
     rnn.save_predict_model(generator=generator,train_list=train_list, test_list=test_list, output_dir=output_dir)
 
+def predict(model_name, participator, load_weight_from):
+    logger_name = model_name + str(participator) + str(load_weight_from)
+    logger = logging.getLogger(logger_name) # so that no multiple loggers input the same data
+    f_time = datetime.datetime.today()
+    output_dir = os.path.join('output', 'predict_'+str(f_time))
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    hdlr = logging.FileHandler(os.path.join(output_dir, 'rnn.log'))
+    logger.addHandler(hdlr)
+    console_handler = logging.StreamHandler()
+    logger.addHandler(console_handler)
+    logger.setLevel(logging.INFO)
+    gal = GAL_data()
+    gal.set_logger(logger)
+    gal.load_data(load_list=['eeg', 'kin'])
+    data_description = gal.get_data_description()
+    participator = participator
+    logger.info('participator : {0}'.format(participator))
+
+    rnn = EEG_rnn_batch(None)
+    rnn.set_logger(logger)
+    rnn.select_model(model_name)
+    rnn.load_model_weight(model_name, load_weight_from)
+
+    logger.info( 'running model data from a generator')
+    data_len=gal.part_data_count[participator]
+    data_split_ratio = [0.8, 0.2]
+    train_list = np.arange(int(data_len * data_split_ratio[0]))
+    test_list = np.arange(data_len - int(data_len * data_split_ratio[0]))
+
+    rnn.set_data_description(data_description)
+    generator = gal.data_generator_kin(part=participator, timesteps=10, stride=10)
+    rnn.save_predict_model(generator=generator,train_list=train_list, test_list=test_list, output_dir=output_dir)
+
 
 if __name__ == '__main__':
-    #run_model_duration(model_name='simple_rnn_1', participator=1, timesteps=50, stride=1, nb_epoch=20)
-    #run_model_kin(model_name='seq_to_seq', participator=1, timesteps=10, stride=1, nb_epoch=20)
-    run_model_kin_generator(model_name='seq_to_seq', participator=1, timesteps=10, stride=10, nb_epoch=100)
-    run_model_kin_generator(model_name='seq_to_seq', participator=1, timesteps=20, stride=10, nb_epoch=100)
-    run_model_kin_generator(model_name='seq_to_seq', participator=1, timesteps=30, stride=10, nb_epoch=100)
-    run_model_kin_generator(model_name='seq_to_seq', participator=1, timesteps=40, stride=10, nb_epoch=100)
+    run_model_kin_generator(model_name='seq_to_seq', participator=1, timesteps=1000, stride=1000, nb_epoch=100)
+    run_model_kin_generator(model_name='seq_to_seq', participator=1, timesteps=500, stride=500, nb_epoch=100)
+    # run_model_kin_generator(model_name='seq_to_seq', participator=1, timesteps=500, stride=500, nb_epoch=100)
 
 
