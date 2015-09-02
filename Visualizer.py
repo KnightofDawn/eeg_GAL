@@ -101,13 +101,7 @@ class Visualizer():
                 plt.show()
 
 
-data_dir = '2015-09-02 07:38:10.474885'
-load_dir = os.path.join('output', data_dir)
 
-vis = Visualizer()
-sensor_num = '2'
-vis.load_data(load_dir = load_dir, data_type='train')
-vis.plot_3d(sensor_num= sensor_num)
 
 
 
