@@ -223,24 +223,6 @@ class GAL_data():
 
         self.logger.info( 'saved data as pickle')
 
-    def save_raw_data_json(self):
-        # assert not os.path.exists(os.path.join('data', 'eeg_info_dict.pkl')), 'pickled data already exist'
-        assert self.eeg_dict != None, 'eeg_dict null'
-        assert self.info_dict != None, 'info_dict null'
-        assert self.emg_dict != None, 'emg_dict null'
-        assert self.kin_dict != None, 'kin_dict null'
-
-        with open(os.path.join('data', 'eeg_dict.json'), 'w') as f:
-            json.dump(self.eeg_dict, f)
-        with open(os.path.join('data', 'info_dict.json'), 'w') as f:
-            json.dump(self.info_dict, f)
-        with open(os.path.join('data', 'kin_dict.json'), 'w') as f:
-            json.dump(self.kin_dict, f)
-        with open(os.path.join('data', 'emg_dict.json'), 'w') as f:
-            json.dump(self.emg_dict, f)
-
-        self.logger.info( 'saved data as json')
-
     def load_data(self, load_list=('eeg', 'info', 'emg', 'kin')):
 
         for file in load_list:
@@ -453,6 +435,78 @@ class GAL_data():
 
             yield [X, y]
 
+    def data_event(self, part, timesteps, stride, event_list, partition_ratio, input_dim=32):
+
+        assert input_dim == self.eeg_dict[self.eeg_dict.keys()[0]].shape[1], 'input dim doesn\'t match'
+
+        self.data_description['participator'] = part
+        self.data_description['timesteps'] = timesteps
+        self.data_description['stride'] = stride
+        self.data_description['event_list'] = event_list
+
+        part_list = [x for x in self.eeg_dict.keys() if x[0] == part]
+
+        train_num = int(len(part_list) * partition_ratio[0])
+        val_num = int(len(part_list) * partition_ratio[1])
+        test_num = int(len(part_list) - train_num - val_num)
+
+        def make_data(part_list):
+            total_samples = 0
+            nb_samples_list = list()
+            for key in part_list:
+                trial_step_size = self.eeg_dict[key].shape[0]
+                nb_samples = (trial_step_size - timesteps) / stride + 1
+                nb_samples_list.append(nb_samples)
+                total_samples = total_samples + nb_samples
+
+            X = np.zeros((total_samples, timesteps, input_dim))
+            y = np.zeros((total_samples, len(event_list)))
+
+            cum_index = 0
+
+            for index, key in enumerate(part_list):
+                temp = self.eeg_dict[key]
+                for i in np.arange(nb_samples_list[index]):
+                    X[i+cum_index,:,:] = temp[i*stride:i*stride+timesteps,:]
+
+                handstart = int(self.info_dict[key]['tHandStart'].values / 0.002)
+                bothdigittouch = int(self.info_dict[key]['tBothDigitTouch'].values / 0.002)
+                bothstartload = int(self.info_dict[key]['tBothStartLoadPhase'].values / 0.002)
+                liftoff = int(self.info_dict[key]['tLiftOff'].values / 0.002)
+                maxLF = int(self.info_dict[key]['tLF_Max'].values / 0.002)
+                #max_P1_height = int(self.kin_dict[key]['Pz1 - position z sensor 1'].values / 0.002)
+                LEDOff = int(self.info_dict[key]['LEDOff'].values / 0.002)
+                replace = int(self.info_dict[key]['tReplace'].values / 0.002)
+                bothreleased = int(self.info_dict[key]['tBothReleased'].values / 0.002)
+                handstop = int(self.info_dict[key]['tHandStop'].values / 0.002)
+
+
+                y[cum_index + np.arange(handstart, bothdigittouch), event_list.index('Dur_Reach')] = 1
+                #y[bothdigittouch:bothstartload, event_list.index('Dur_Preload')] = 1
+                y[cum_index + np.arange(bothdigittouch, maxLF), event_list.index('Dur_LoadReach')] = 1
+                y[cum_index + np.arange(maxLF, LEDOff), event_list.index('Dur_LoadMaintain')] = 1
+                y[cum_index + np.arange(LEDOff, replace), event_list.index('Dur_LoadRetract')] = 1
+                #y[replace:bothreleased, event_list.index('Dur_Release')] = 1
+                y[cum_index + np.arange(replace, handstop), event_list.index('Dur_Retract')] = 1
+
+                cum_index = cum_index + nb_samples_list[index]
+
+            X = X.astype('float32')
+            y = y.astype('float32')
+
+            return [X, y]
+
+        train_X , train_y = make_data(part_list[:train_num])
+        val_X , val_y = make_data(part_list[train_num:train_num+val_num])
+        test_X , test_y = make_data(part_list[train_num+val_num:])
+
+        return [train_X, train_y, val_X, val_y, test_X, test_y]
+
+    def preprocess_kin(self):
+        for key in self.eeg_dict.keys():
+            self.eeg_dict[key] = self.eeg_dict[key][1000:,:]
+        self.data_description['preprocess'] = 'sliced after 1000'
+
     def data_generator_kin(self, part, timesteps, stride, input_dim=32):
         assert input_dim == self.eeg_dict[self.eeg_dict.keys()[0]].shape[1], 'input dim doesn\'t match'
 
@@ -491,12 +545,6 @@ class GAL_data():
             y = y.astype('float32')
 
             yield [X, y, key]
-
-    def save_X_y(self):
-        for key in self.X_dict.keys():
-            np.save(os.path.join('data', 'X_'+str(key)+'.npy'), self.X_dict[key])
-            np.save(os.path.join('data', 'y_'+str(key)+'.npy'), self.y_dict[key])
-        self.logger.info( 'saved X and y')
 
     def get_data_description(self):
         return self.data_description
@@ -583,12 +631,25 @@ class EEG_rnn_batch():
             model.compile(loss='mean_squared_error', optimizer='adadelta')
             return model
 
-        def seq_to_seq():
+        def seq_to_seq_2():
             self.model_config['dropout'] = [0.0, 0.0]
             model = Sequential()
             model.add(LSTM(input_dim=32, output_dim=32, return_sequences=True))
             model.add(Dropout(0.0))
             model.add(TimeDistributedDense(32,9))# output shape: (nb_samples, nb_timesteps, 9)
+            model.add(Activation('linear'))
+            model.compile(loss='mean_squared_error', optimizer='adadelta')
+            return model
+
+        def seq_to_seq_3():
+            self.model_config['dropout'] = [0.0, 0.0]
+            model = Sequential()
+            model.add(LSTM(input_dim=32, output_dim=64, return_sequences=True))
+            model.add(Dropout(0.5))
+            model.add(TimeDistributedDense(64,64))# output shape: (nb_samples, nb_timesteps, 9)
+            model.add(Activation('relu'))
+            model.add(Dropout(0.5))
+            model.add(TimeDistributedDense(64,9))
             model.add(Activation('linear'))
             model.compile(loss='mean_squared_error', optimizer='adadelta')
             return model
@@ -601,33 +662,6 @@ class EEG_rnn_batch():
         self.model.load_weights(os.path.join('output', folder_name, 'weight.hdf'))
         self.model_config['weight_loaded_from'] = folder_name
         self.logger.info('loaded model weight from {0}'.format(folder_name))
-
-    def run_model_temp(self, part_list, batch_size, nb_epoch, train_test_ratio):
-
-        self.model_config['partcipant_list'] = part_list
-        self.model_config['batch size'] = batch_size
-        self.model_config['number of epochs'] = nb_epoch
-        self.model_config['number of epochs'] = train_test_ratio
-
-        for part in part_list:
-            key_list = [x for x in self.X_dict.keys() if x == part]
-            train_num = int(len(key_list) * train_test_ratio)
-            train_list = key_list[:train_num]
-            test_list = key_list[train_num:]
-
-            for epoch in range(nb_epoch):
-                self.logger.info( 'epoch', epoch)
-                for key in train_list:
-                    X_train = self.X_dict[key]
-                    y_train = self.y_dict[key]
-                    loss, accuracy = self.model.train_on_batch(X = X_train, y = y_train, accuracy = True)
-                    self.logger.info( 'train key : {0}, loss : {1}, accuracy : {2}'.format(key, loss, accuracy))
-
-                for key in test_list:
-                    X_test = self.X_dict[key]
-                    y_test = self.y_dict[key]
-                    loss, accuracy = self.model.test_on_batch(X = X_test, y = y_test, accuracy = True)
-                    self.logger.info( 'test key : {0}, loss : {1}, accuracy : {2}'.format(key, loss, accuracy))
 
     def run_model_with_generator_event(self, generator, train_list, validate_list, test_list):
 
@@ -663,24 +697,12 @@ class EEG_rnn_batch():
         run(data_list = validate_list, data_type='validate')
         run(data_list=test_list, data_type= 'test')
 
-    def run_model_kin(self, generator, train_list, test_list, nb_epoch):
-        self.model_config['train_data_size'] = len(train_list)
-        self.model_config['test_data_size'] = len(test_list)
-        self.logger.info('running model with full fitting')
-        X_train = None
-        y_train = None
-        for _ in train_list:
-            X, y, key = generator.next()
-            if X_train == None:
-                X_train = X
-                y_train = y
-            else:
-                X_train = np.vstack((X_train, X))
-                y_train = np.vstack((y_train, y))
-
-        loss_history = self.model.fit(X=X_train, y=y_train, show_accuracy=True, nb_epoch = nb_epoch)
-
-        return loss_history
+    def run_model_event(self, data, nb_epoch):
+        [train_X, train_y, val_X, val_y, test_X, test_y] = data
+        loss_train = self.model.fit(X=train_X, y=train_y, show_accuracy=True, nb_epoch = nb_epoch)
+        loss_val = self.model.fit(X=val_X, y=val_y, show_accuracy=True, nb_epoch = nb_epoch)
+        loss_test = self.model.fit(X=test_X, y=test_y, show_accuracy=True, nb_epoch = nb_epoch)
+        return loss_train, loss_val, loss_test
 
     def run_model_with_generator_kin(self, generator, train_list, test_list):
 
@@ -699,9 +721,9 @@ class EEG_rnn_batch():
 
         train_loss = run(data_list=train_list, data_type = 'train')
         test_loss = run(data_list=test_list, data_type= 'test')
-        return train_loss
+        return train_loss, test_loss
 
-    def save_score_model(self, generator, train_list, validate_list, test_list, event_list, output_dir):
+    def save_event_generator(self, generator, train_list, validate_list, test_list, event_list, output_dir):
         assert self.data_description != None, 'data_description is not set'
 
         def evaluate_score_revised(self, data_list, data_type, param_threshold_list = None, generator=generator, event_list=event_list, output_dir = output_dir):
@@ -808,7 +830,111 @@ class EEG_rnn_batch():
                 f.write('{0} : {1}\n'.format(key, self.model_config[key]))
         self.logger.info('model_config.txt saved')
 
-    def save_predict_model(self, generator, train_list, test_list, output_dir):
+    def save_event(self, data, event_list, output_dir):
+        assert self.data_description != None, 'data_description is not set'
+
+        def evaluate_score_revised(self, data, data_type, param_threshold_list = None, event_list=event_list, output_dir = output_dir):
+            start = time.clock()
+            self.logger.info('predicting values : {0}'.format(data_type))
+
+
+            [X, y]  = data
+
+            pred = self.model.predict(X)
+
+            nb_classes = len(event_list)
+
+            if param_threshold_list == None:
+                param_threshold_list = list()
+
+            if data_type == 'validate' or data_type == 'test':
+                f1_score_list = list()
+                precision_list = list()
+                recall_list = list()
+            elif data_type =='train':
+                f1_score_list = None
+                precision_list = None
+                recall_list = None
+
+
+            for i in range(nb_classes):
+                if data_type == 'validate':
+                    precision, recall, thresholds = sklearn.metrics.precision_recall_curve(y[:,i], pred[:,i], pos_label = 1)
+                    f1_score = np.asarray([2 * prec * rec / (prec + rec) for prec, rec in zip(precision, recall)])
+                    max_f1_score = max(f1_score)
+                    index = np.where(f1_score == max_f1_score)
+                    param_threshold_list.append(thresholds[index])
+                    f1_score_list.append(max_f1_score)
+                    precision_list.append(precision[index])
+                    recall_list.append(recall[index])
+                elif data_type == 'test':
+                    pred_binary_one_class = (pred[:,i] > param_threshold_list[i]).astype(int)
+                    f1_score = sklearn.metrics.f1_score(y[:,i], pred_binary_one_class)
+                    precision = sklearn.metrics.precision_score(y[:,i], pred_binary_one_class)
+                    recall = sklearn.metrics.recall_score(y[:,i], pred_binary_one_class)
+                    f1_score_list.append(f1_score)
+                    precision_list.append(precision)
+                    recall_list.append(recall)
+
+            auc_roc_score = [sklearn.metrics.roc_auc_score(y[:, i], pred[:, i]) for i in range(nb_classes)]
+            auc_pr_score = [sklearn.metrics.average_precision_score(y[:, i], pred[:, i]) for i in range(nb_classes)]
+
+            score = pd.DataFrame(index = event_list)
+            score['auc_roc_score'] = auc_roc_score
+            score['auc_pr_score'] = auc_pr_score
+            score['f1_score'] = f1_score_list
+            score['precision_score'] = precision_list
+            score['recall_score'] = recall_list
+
+
+            self.logger.info( ('time elapsed : {0} seconds'.format(time.clock() - start)))
+            self.logger.info( (data_type+' auc_roc : ', auc_roc_score))
+            self.logger.info( (data_type+' auc_pr : ', auc_pr_score))
+
+            if data_type == 'validate':
+                self.logger.info((data_type+' threshold : ', param_threshold_list))
+                self.logger.info( (data_type+' max f1 : ', f1_score_list))
+                self.logger.info( (data_type+' precision : ', precision_list))
+                self.logger.info( (data_type+' recall : ', recall_list))
+            elif data_type == 'test':
+                self.logger.info( (data_type+' max f1 : ', f1_score_list))
+                self.logger.info( (data_type+' precision : ', precision_list))
+                self.logger.info( (data_type+' recall : ', recall_list))
+            elif data_type == 'train':
+                pass
+
+            return score, param_threshold_list
+
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        [train_X, train_y, val_X, val_y, test_X, test_y, train_num, val_num, test_num] = data
+
+        validate_score, param_threshold_list = evaluate_score_revised(self, [val_X, val_y], 'validate')
+        train_score, _ = evaluate_score_revised(self, [train_X, train_y], 'train')
+        test_score, _ = evaluate_score_revised(self, [test_X, test_y], 'test', param_threshold_list=param_threshold_list)
+
+        validate_score.to_csv(os.path.join(output_dir, 'validate_score.csv'))
+        train_score.to_csv(os.path.join(output_dir, 'train_score.csv'))
+        test_score.to_csv(os.path.join(output_dir, 'test_score.csv'))
+
+        self.model.save_weights(os.path.join(output_dir, 'weight.hdf'))
+
+        self.model_config['threshold'] = param_threshold_list
+        with open(os.path.join(output_dir, 'data_description.txt'), 'w') as f:
+            for key in self.data_description.keys():
+                f.write('{0} : {1}\n'.format(key, self.data_description[key]))
+
+        self.logger.info('data_description.txt saved')
+
+        with open(os.path.join(output_dir, 'model_config.txt'), 'w') as f:
+            for key in self.model_config.keys():
+                if isinstance(self.model_config[key], collections.Iterable) and not isinstance(self.model_config[key], basestring):
+                    self.model_config[key] = ', '.join([str(i) for i in self.model_config[key]])
+                f.write('{0} : {1}\n'.format(key, self.model_config[key]))
+        self.logger.info('model_config.txt saved')
+
+    def save_kin_generator(self, generator, train_list, test_list, output_dir):
 
         self.model.save_weights(os.path.join(output_dir, 'weight.hdf'))
 

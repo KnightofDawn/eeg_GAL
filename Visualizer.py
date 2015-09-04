@@ -9,19 +9,16 @@ __author__ = 'jinwon'
 
 from matplotlib import pyplot
 
-
+plt.style.use('ggplot')
 
 class Visualizer():
 
     def __init__(self):
         self.predict = None
         self.true = None
-        self.col_name = ['Px1', 'Px2', 'Px3', 'Px4', 'Py1', 'Py2', 'Py3', 'Py4', 'Pz1', 'Pz2', 'Pz3', 'Pz4']
+        self.col_name = ['Px2', 'Px3', 'Px4', 'Py2', 'Py3', 'Py4', 'Pz2', 'Pz3', 'Pz4']
         self.data_type = None
         self.data_description = dict()
-
-
-
 
     def load_data(self, load_dir, data_type):
         print 'loading files'
@@ -30,13 +27,13 @@ class Visualizer():
         self.data_type = data_type
         for dirpath, directory, files in os.walk(os.path.join(load_dir, data_type)):
             for filename in files:
-                match_pred = re.match('train_(.+,.+,.+)_pred\.npy', filename)
+                match_pred = re.match('{0}_(.+,.+,.+)_pred\.npy'.format(data_type), filename)
                 if match_pred != None:
                     key = match_pred.groups()
                     predict[key] = np.load(os.path.join(dirpath, filename))
 
 
-                match_true = re.match('train_(.+,.+,.+)_true.npy', filename)
+                match_true = re.match('{0}_(.+,.+,.+)_true.npy'.format(data_type), filename)
                 if match_true != None:
                     key = match_true.groups()
                     true[key] = np.load(os.path.join(dirpath, filename))
@@ -48,9 +45,6 @@ class Visualizer():
 
         self.predict = predict
         self.true = true
-
-
-
 
     def plot_2d(self, sensor_id=None):
         print 'start 2d ploting'
@@ -99,6 +93,19 @@ class Visualizer():
 
                 plt.legend(loc = 'upper right')
                 plt.show()
+
+    def error_plot(self, load_dir):
+        train_loss = pd.read_csv(os.path.join(load_dir, 'train_loss.csv'))
+        test_loss = pd.read_csv(os.path.join(load_dir, 'test_loss.csv'))
+
+        plt.plot(np.arange(len(train_loss)), train_loss, label='train loss')
+        plt.plot(np.arange(len(train_loss)), test_loss, label='test loss')
+        plt.xlabel('epoch')
+        plt.ylabel('loss')
+        plt.title('loss by epoch')
+        plt.legend(loc='upper right')
+        plt.show()
+
 
 
 
