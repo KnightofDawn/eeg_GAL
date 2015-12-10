@@ -1,24 +1,28 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function
-import json
+
 import os
-import pdb
+
 import re
 import cPickle
-import datetime
-import collections
 
+import collections
 import pandas as pd
 from scipy.io import loadmat
 import numpy as np
-import logging
+
 from keras.models import Sequential
-from keras.layers.core import Dense, Dropout, Activation, TimeDistributedDense
-from keras.layers.recurrent import LSTM, SimpleDeepRNN
+from keras.layers.convolutional import Convolution1D, MaxPooling1D
+from keras.layers.core import Dense, Dropout, Activation, TimeDistributedDense, Flatten
+from keras.layers.recurrent import LSTM, SimpleRNN, GRU, JZS1, JZS2, JZS3
+from keras.utils import np_utils
 import time
 import sklearn
 
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, confusion_matrix, accuracy_score
+
+
+from scipy.signal import lfilter, butter
 
 __author__ = 'jinwon'
 
@@ -377,6 +381,126 @@ class GAL_data():
         self.total_count = normal_count + add_count + discard_count
         self.trial_length = trail_length
 
+    def preprocess_filter(self, max_freq, min_freq, low_pass, N_filter=4):
+
+        def butter_lowpass(highcut, fs, order):
+            nyq = 0.5 * fs
+            high = highcut / nyq
+            b, a = butter(order, high, btype="lowpass")
+            return b, a
+
+        def butter_bandpass(lowcut, highcut, fs, order):
+            nyq = 0.5 * fs
+            cutoff = [lowcut / nyq, highcut / nyq]
+            b, a = butter(order, cutoff, btype="bandpass")
+            return b, a
+
+        def butter_highpass(highcut, fs, order):
+            nyq = 0.5 * fs
+            high = highcut / nyq
+            b, a = butter(order, high, btype="highpass")
+            return b, a
+
+        if low_pass == True:
+            b, a = butter_lowpass(max_freq, fs=500, order=N_filter)
+            for key in self.eeg_dict.keys():
+                x = lfilter(b, a, self.eeg_dict[key], axis=0)
+                self.eeg_dict[key] = x
+        else:
+            b, a = butter_bandpass(min_freq, max_freq, fs=500, order=N_filter)
+            for key in self.eeg_dict.keys():
+                x = lfilter(b, a, self.eeg_dict[key], axis=0)
+                self.eeg_dict[key] = x
+
+        self.logger.info('preprocessed by butter band passing')
+        self.data_description['preprocess_filter'] = '{}_{}'.format(max_freq, min_freq)
+
+    def preprocess_filter_multiple(self, N_filter=4):
+
+        def butter_lowpass(highcut, fs, order):
+            nyq = 0.5 * fs
+            high = highcut / nyq
+            b, a = butter(order, high, btype="lowpass")
+            return b, a
+
+        def butter_bandpass(lowcut, highcut, fs, order):
+            nyq = 0.5 * fs
+            cutoff = [lowcut / nyq, highcut / nyq]
+            b, a = butter(order, cutoff, btype="bandpass")
+            return b, a
+
+        def butter_highpass(highcut, fs, order):
+            nyq = 0.5 * fs
+            high = highcut / nyq
+            b, a = butter(order, high, btype="highpass")
+            return b, a
+
+        for key in self.eeg_dict.keys():
+            agg = None
+            for min_freq, max_freq in zip([0.1, 4, 8, 13], [4, 8, 13, 30]):
+                b, a = butter_bandpass(min_freq, max_freq, fs=500, order=N_filter)
+                x = lfilter(b, a, self.eeg_dict[key], axis=0)
+                if agg == None:
+                    agg = x
+                else :
+                    agg = np.hstack((agg, x))
+            self.eeg_dict[key] = agg
+
+        self.logger.info('preprocessed by butter band passing')
+
+    def save_individual_eeg(self):
+        # for key in self.eeg_dict.keys():
+        #     np.savetxt(os.path.join('preprocess_eeg', '{0}_eeg.csv'.format(key)), self.eeg_dict[key], delimiter=',')
+
+        part_list = [x for x in self.eeg_dict.keys()]
+
+        part_list.sort(key = lambda  x : x[0] * 100000 + x[1] * 100 + x[2])
+
+        diff = list()
+        for key in part_list:
+            height = self.kin_dict[key][u'Pz1 - position z sensor 1']
+            diff_temp = np.diff(height)
+            diff.extend(diff_temp)
+
+        diff_reach_threshold = 0 #np.percentile(diff, 90)
+        diff_retract_threshold = 0 #np.percentile(diff, 20)
+
+
+        for index, key in enumerate(part_list):
+
+            handstart = int(self.info_dict[key]['tHandStart'].values / 0.002)
+            bothdigittouch = int(self.info_dict[key]['tBothDigitTouch'].values / 0.002)
+            bothreleased = int(self.info_dict[key]['tBothReleased'].values / 0.002)
+            handstop = int(self.info_dict[key]['tHandStop'].values / 0.002)
+
+            height = self.kin_dict[key][u'Pz1 - position z sensor 1']
+            diff = np.diff(height)
+            after_peak = np.argmax(diff)
+
+            i=0
+            while(after_peak + i <= len(diff)):
+                if diff[after_peak+i] >= diff_reach_threshold and diff[after_peak+i+1] <= diff_reach_threshold:
+                    break
+                i = i +1
+
+            stop_reach = after_peak + i
+
+            before_valley = np.argmin(diff)
+
+            i=0
+            while(before_valley - i >= 0):
+                if diff[before_valley - i] <= diff_retract_threshold and diff[before_valley-i-1] >= diff_retract_threshold:
+                    break
+                i = i + 1
+
+            start_retract = before_valley - i
+
+            limestones = [handstart, bothdigittouch, stop_reach, start_retract, bothreleased, handstop]
+
+            df = pd.DataFrame(columns=['handstart', 'bothdigittouch', 'stop_reach', 'start_retract', 'both_released', 'handstop'])
+            df.loc[0,:] = limestones
+            df.to_csv(os.path.join('preprocess_eeg', '{0}_limestones.csv'.format(key)), index=False)
+
     def data_generator_event(self, part, timesteps, stride, event_list, event_range=None, input_dim=32):
 
         if event_range != None:
@@ -409,16 +533,16 @@ class GAL_data():
                     event_time_step = int(self.info_dict[key][event].values / 0.002)
                     y[(event_time_step + event_range - trial_step_size)/stride, index] = 1
             else:
-                handstart = int(self.info_dict[key]['tHandStart'].values / 0.002)
-                bothdigittouch = int(self.info_dict[key]['tBothDigitTouch'].values / 0.002)
-                bothstartload = int(self.info_dict[key]['tBothStartLoadPhase'].values / 0.002)
-                liftoff = int(self.info_dict[key]['tLiftOff'].values / 0.002)
-                maxLF = int(self.info_dict[key]['tLF_Max'].values / 0.002)
+                handstart = int(self.info_dict[key]['tHandStart'].values / 0.002) - timesteps
+                bothdigittouch = int(self.info_dict[key]['tBothDigitTouch'].values / 0.002) - timesteps
+                bothstartload = int(self.info_dict[key]['tBothStartLoadPhase'].values / 0.002) - timesteps
+                liftoff = int(self.info_dict[key]['tLiftOff'].values / 0.002) - timesteps
+                maxLF = int(self.info_dict[key]['tLF_Max'].values / 0.002) - timesteps
                 #max_P1_height = int(self.kin_dict[key]['Pz1 - position z sensor 1'].values / 0.002)
-                LEDOff = int(self.info_dict[key]['LEDOff'].values / 0.002)
-                replace = int(self.info_dict[key]['tReplace'].values / 0.002)
-                bothreleased = int(self.info_dict[key]['tBothReleased'].values / 0.002)
-                handstop = int(self.info_dict[key]['tHandStop'].values / 0.002)
+                LEDOff = int(self.info_dict[key]['LEDOff'].values / 0.002) - timesteps
+                replace = int(self.info_dict[key]['tReplace'].values / 0.002) - timesteps
+                bothreleased = int(self.info_dict[key]['tBothReleased'].values / 0.002) - timesteps
+                handstop = int(self.info_dict[key]['tHandStop'].values / 0.002) - timesteps
 
 
                 y[handstart:bothdigittouch, event_list.index('Dur_Reach')] = 1
@@ -429,6 +553,89 @@ class GAL_data():
                 #y[replace:bothreleased, event_list.index('Dur_Release')] = 1
                 y[replace:handstop, event_list.index('Dur_Retract')] = 1
                 # TODO fix the DurMaintain and LoadReach by using the x,y,z coordinates information
+
+            X = X.astype('float32')
+            y = y.astype('float32')
+
+            yield [X, y]
+
+    def data_generator_event_classify(self, part, timesteps, stride, event_list, input_dim=32):
+
+        assert input_dim == self.eeg_dict[self.eeg_dict.keys()[0]].shape[1], 'input dim doesn\'t match'
+
+        self.data_description['participator'] = part
+        self.data_description['timesteps'] = timesteps
+        self.data_description['stride'] = stride
+        self.data_description['event_list'] = event_list
+
+        part_list = [x for x in self.eeg_dict.keys() if x[0] == part]
+
+
+        diff = list()
+        for key in part_list:
+            height = self.kin_dict[key][u'Pz1 - position z sensor 1']
+            diff_temp = np.diff(height)
+            diff.extend(diff_temp)
+
+        diff_reach_threshold = np.percentile(diff, 90)
+        diff_retract_threshold = np.percentile(diff, 20)
+
+        for key in part_list:
+            # nb_samples = (self.trial_length - timesteps) / stride + 1
+            trial_step_size = self.eeg_dict[key].shape[0]
+            nb_samples = (trial_step_size - timesteps) / stride + 1
+
+
+            LEDOn = int(self.info_dict[key]['LEDOn'].values / 0.002)
+            handstart = int(self.info_dict[key]['tHandStart'].values / 0.002)
+            bothdigittouch = int(self.info_dict[key]['tBothDigitTouch'].values / 0.002)
+            bothstartload = int(self.info_dict[key]['tBothStartLoadPhase'].values / 0.002)
+            liftoff = int(self.info_dict[key]['tLiftOff'].values / 0.002)
+            # maxLF = int(self.info_dict[key]['tLF_Max'].values / 0.002)
+            #max_P1_height = int(self.kin_dict[key]['Pz1 - position z sensor 1'].values / 0.002)
+            LEDOff = int(self.info_dict[key]['LEDOff'].values / 0.002)
+            replace = int(self.info_dict[key]['tReplace'].values / 0.002)
+            bothreleased = int(self.info_dict[key]['tBothReleased'].values / 0.002)
+            handstop = int(self.info_dict[key]['tHandStop'].values / 0.002)
+
+            height = self.kin_dict[key][u'Pz1 - position z sensor 1']
+            diff = np.diff(height)
+            after_peak = np.argmax(diff)
+
+            for i in range(1000):
+                if diff[after_peak+i] >= diff_reach_threshold and diff[after_peak+i+1] <= diff_reach_threshold:
+                    break
+
+            stop_Reach = after_peak + i
+
+            before_valley = np.argmin(diff)
+
+            for i in range(1000):
+                if diff[before_valley - i] <= diff_retract_threshold and diff[before_valley-i-1] >= diff_retract_threshold:
+                    break
+
+            start_retract = before_valley - i
+
+            limestones = [handstart, bothdigittouch, stop_Reach, start_retract, bothreleased, handstop]
+
+            assert len(limestones) == len(event_list)
+
+            X = np.zeros((nb_samples, timesteps, input_dim))
+            y = np.zeros((nb_samples, len(event_list)))
+            temp = self.eeg_dict[key]
+
+            for i in np.arange(nb_samples):
+                start = i *stride
+                end = i*stride + timesteps
+                X[i,:,:] = temp[start:end,:]
+                for lime_num, lime in enumerate(limestones):
+                    if start - lime + end - lime <= 0 :
+                        y[i, lime_num] = 1
+                        break
+                    if lime_num == len(limestones) - 1:
+                        y[i, 0] = 1
+                        # same Idle state
+
 
             X = X.astype('float32')
             y = y.astype('float32')
@@ -502,6 +709,235 @@ class GAL_data():
 
         return [train_X, train_y, val_X, val_y, test_X, test_y]
 
+    def data_event_classify(self, part, timesteps, stride, event_list, partition_ratio, input_dim=32):
+
+        assert input_dim == self.eeg_dict[self.eeg_dict.keys()[0]].shape[1], 'input dim doesn\'t match'
+
+        self.data_description['participator'] = part
+        self.data_description['timesteps'] = timesteps
+        self.data_description['stride'] = stride
+        self.data_description['event_list'] = event_list
+        self.data_description['data_sorted'] = 'sorted'
+        part_list = [x for x in self.eeg_dict.keys() if x[0] == part]
+
+        part_list.sort(key = lambda  x : x[0] * 100000 + x[1] * 100 + x[2])
+
+        train_num = int(len(part_list) * partition_ratio[0])
+        val_num = int(len(part_list) * partition_ratio[1])
+        test_num = int(len(part_list) - train_num - val_num)
+
+        def make_data(part_list):
+            total_samples = 0
+            nb_samples_list = list()
+            for key in part_list:
+                trial_step_size = self.eeg_dict[key].shape[0]
+                nb_samples = (trial_step_size - timesteps) / stride + 1
+                nb_samples_list.append(nb_samples)
+                total_samples = total_samples + nb_samples
+
+
+            print (total_samples)
+
+            diff = list()
+            for key in part_list:
+                height = self.kin_dict[key][u'Pz1 - position z sensor 1']
+                diff_temp = np.diff(height)
+                diff.extend(diff_temp)
+
+            diff_reach_threshold = 0 #np.percentile(diff, 90)
+            diff_retract_threshold = 0 #np.percentile(diff, 20)
+
+            X = np.zeros((total_samples, timesteps, input_dim))
+            y = np.zeros((total_samples, len(event_list)))
+
+
+            cum_index = 0
+
+            for index, key in enumerate(part_list):
+
+                handstart = int(self.info_dict[key]['tHandStart'].values / 0.002)
+                bothdigittouch = int(self.info_dict[key]['tBothDigitTouch'].values / 0.002)
+                bothreleased = int(self.info_dict[key]['tBothReleased'].values / 0.002)
+                handstop = int(self.info_dict[key]['tHandStop'].values / 0.002)
+
+                height = self.kin_dict[key][u'Pz1 - position z sensor 1']
+                diff = np.diff(height)
+                after_peak = np.argmax(diff)
+
+                for i in range(1000):
+                    if diff[after_peak+i] >= diff_reach_threshold and diff[after_peak+i+1] <= diff_reach_threshold:
+                        break
+
+                stop_reach = after_peak + i
+
+                before_valley = np.argmin(diff[1000:]) + 1000
+
+                for i in range(1000):
+                    if diff[before_valley - i] <= diff_retract_threshold and diff[before_valley-i-1] >= diff_retract_threshold:
+                        break
+
+                start_retract = before_valley - i
+
+                limestones = [handstart, bothdigittouch, stop_reach, start_retract, bothreleased, handstop]
+
+
+                assert len(limestones) == len(event_list)
+                assert np.all(np.diff(limestones) > 0), 'not aligned {} {} {} {} {} {}'.format(*limestones)
+
+
+
+                temp = self.eeg_dict[key]
+
+                for i in np.arange(nb_samples_list[index]):
+                    start = i *stride
+                    end = i*stride + timesteps
+                    X[cum_index+i,:,:] = temp[start:end,:]
+                    # X[cum_index+i,:,:] = np.mean(temp[start:end,:], axis= 0), np.mean(temp[start-100:end-100,:], axis= 0)
+
+
+                    for lime_num, lime in enumerate(limestones):
+
+                        if end < lime:
+                            y[cum_index+i, lime_num] = 1
+                            break
+                        if lime_num == len(limestones) - 1:
+                            y[cum_index +i, 0] = 1
+
+                        '''
+                        if start - lime + end - lime <= 0 :
+                            y[cum_index+i, lime_num] = 1
+                            break
+                        if lime_num == len(limestones) - 1:
+                            y[cum_index+i, 0] = 1
+                            # same Idle state
+                        '''
+
+                cum_index = cum_index + nb_samples_list[index]
+
+            X = X.astype('float32')
+            y = y.astype('float32')
+
+            # mask = np.where(y[:, 0] != 1)
+            #
+            #
+            # X = X[mask[0], :, :]
+            #
+            # y = y[mask[0],1:]
+            #
+            # mask_2 = np.where(np.sum(y, axis= 1) != 0)
+            #
+            # X =X[mask_2[0], :,:]
+            # y = y[mask_2[0], :]
+
+            return [X, y]
+
+        train_X , train_y = make_data(part_list[:train_num])
+        val_X , val_y = make_data(part_list[train_num:train_num+val_num])
+        test_X , test_y = make_data(part_list[train_num+val_num:])
+
+        # train_X , train_y = make_data(train_list[:int(len(train_list) * 0.9)])
+        # val_X , val_y = make_data(train_list[int(len(train_list) * 0.9):])
+        # test_X , test_y = make_data(test_list)
+
+        return [train_X, train_y, val_X, val_y, test_X, test_y]
+
+    def data_intention_classify(self, part, timesteps, stride, event_list, partition_ratio, input_dim=32):
+
+        assert input_dim == self.eeg_dict[self.eeg_dict.keys()[0]].shape[1], 'input dim doesn\'t match'
+
+        self.data_description['participator'] = part
+        self.data_description['timesteps'] = timesteps
+        self.data_description['stride'] = stride
+        self.data_description['event_list'] = event_list
+        self.data_description['data_sorted'] = 'sorted'
+        part_list = [x for x in self.eeg_dict.keys() if x[0] == part]
+
+        part_list.sort(key = lambda  x : x[0] * 100000 + x[1] * 100 + x[2])
+
+        train_num = int(len(part_list) * partition_ratio[0])
+        val_num = int(len(part_list) * partition_ratio[1])
+        test_num = int(len(part_list) - train_num - val_num)
+
+        def make_data(part_list):
+            total_samples = 0
+            nb_samples_list = list()
+            for key in part_list:
+                trial_step_size = self.eeg_dict[key].shape[0]
+                nb_samples = (trial_step_size - timesteps) / stride + 1
+                nb_samples_list.append(nb_samples)
+                total_samples = total_samples + nb_samples
+
+            diff = list()
+            for key in part_list:
+                height = self.kin_dict[key][u'Pz1 - position z sensor 1']
+                diff_temp = np.diff(height)
+                diff.extend(diff_temp)
+
+            diff_reach_threshold = np.percentile(diff, 90)
+            diff_retract_threshold = np.percentile(diff, 20)
+
+            X = np.zeros((total_samples, timesteps, input_dim))
+            y = np.zeros((total_samples, len(event_list)))
+
+
+            cum_index = 0
+
+            for index, key in enumerate(part_list):
+
+                handstart = int(self.info_dict[key]['tHandStart'].values / 0.002)
+                bothdigittouch = int(self.info_dict[key]['tBothDigitTouch'].values / 0.002)
+                bothreleased = int(self.info_dict[key]['tBothReleased'].values / 0.002)
+                handstop = int(self.info_dict[key]['tHandStop'].values / 0.002)
+
+                height = self.kin_dict[key][u'Pz1 - position z sensor 1']
+                diff = np.diff(height)
+                after_peak = np.argmax(diff)
+
+                for i in range(1000):
+                    if diff[after_peak+i] >= diff_reach_threshold and diff[after_peak+i+1] <= diff_reach_threshold:
+                        break
+
+                stop_Reach = after_peak + i
+
+                before_valley = np.argmin(diff)
+
+                for i in range(1000):
+                    if diff[before_valley - i] <= diff_retract_threshold and diff[before_valley-i-1] >= diff_retract_threshold:
+                        break
+
+                start_retract = before_valley - i
+
+                limestones = [handstart, bothdigittouch, stop_Reach, start_retract, bothreleased, handstop]
+
+                assert len(limestones) == len(event_list)
+
+                temp = self.eeg_dict[key]
+
+                for i in np.arange(nb_samples_list[index]):
+                    start = i *stride
+                    end = i*stride + timesteps
+                    X[cum_index+i,:,:] = temp[start:end,:]
+                    for lime_num, lime in enumerate(limestones):
+                        if start - lime + end - lime <= 0 :
+                            y[cum_index+i, lime_num] = 1
+                            break
+                        if lime_num == len(limestones) - 1:
+                            y[cum_index+i, 0] = 1
+                            # same Idle state
+
+                cum_index = cum_index + nb_samples_list[index]
+
+            X = X.astype('float32')
+            y = y.astype('float32')
+
+            return [X, y]
+
+        train_X , train_y, limestones = make_data(part_list[:train_num])
+        val_X , val_y = make_data(part_list[train_num:train_num+val_num])
+        test_X , test_y = make_data(part_list[train_num+val_num:])
+
+        return [train_X, train_y, val_X, val_y, test_X, test_y]
+
     def preprocess_kin(self):
         for key in self.eeg_dict.keys():
             self.eeg_dict[key] = self.eeg_dict[key][1000:,:]
@@ -549,10 +985,7 @@ class GAL_data():
     def get_data_description(self):
         return self.data_description
 
-    def set_logger(self, logger):
-        self.logger=logger
-
-class EEG_rnn_batch():
+class EEG_model():
 
     def __init__(self, event_list):
         self.X_dict = None
@@ -562,6 +995,27 @@ class EEG_rnn_batch():
         self.data_description = None
 
     def select_model(self, model_name):
+
+        def conv_2():
+
+            model = Sequential()
+            fs = np.asarray([3])
+            ps = np.asarray([2])
+            nb_f = np.asarray([8])
+            model.add(Convolution1D(input_dim=1, nb_filter=nb_f[0], filter_length=fs[0], border_mode='full'))
+            model.add(Activation('relu'))
+            model.add(MaxPooling1D(pool_length=ps[0], stride=None)) # stride = None means stride = pool_length
+            out_dim = (32 + fs[0] - 1) / ps[0]
+
+            model.add(Flatten())
+            model.add(Dense(nb_f[0] * out_dim , 64))
+            model.add(Activation('relu'))
+            model.add(Dropout(0.5))
+            model.add(Dense(64, self.nb_classes))
+            model.add(Activation('sigmoid'))
+
+            model.compile(loss='binary_crossentropy', optimizer='adadelta', class_mode='binary')
+            return model
 
         def lstm_1():
             model = Sequential()
@@ -585,34 +1039,58 @@ class EEG_rnn_batch():
             model = Sequential()
             model.add(LSTM(input_dim=32, output_dim=64, return_sequences=True)) # try using a GRU instead, for fun
             model.add(LSTM(input_dim=64, output_dim=64, return_sequences=False))
-            model.add(Dropout(0.0))
+            model.add(Dropout(0.5))
             model.add(Dense(64, 128))
-            model.add(Dropout(0.0))
+            model.add(Dropout(0.5))
             model.add(Dense(128, len(self.event_list)))
             model.add(Activation('sigmoid'))
             model.compile(loss='binary_crossentropy', optimizer='adadelta', class_mode='binary')
 
-            self.model_config['dropout'] = [0.0,0.0]
+            self.model_config['dropout'] = [0.5,0.5]
 
             return model
 
-        def lstm_3_softmax():
+        def lstm_4():
             model = Sequential()
-            model.add(LSTM(input_dim=32, output_dim=64, return_sequences=True)) # try using a GRU instead, for fun
-            model.add(LSTM(input_dim=64, output_dim=64, return_sequences=False))
-            model.add(Dropout(0.0))
+            model.add(LSTM(input_dim=32, output_dim=64, return_sequences=False)) # try using a GRU instead, for fun
+            model.add(Dropout(0.5))
             model.add(Dense(64, 128))
-            model.add(Dropout(0.0))
+            model.add(Dropout(0.5))
             model.add(Dense(128, len(self.event_list)))
-            model.add(Activation('softmax'))
-            model.compile(loss='categorical_crossentropy', optimizer='adadelta', class_mode = 'categorical')
+            model.add(Activation('sigmoid'))
+            model.compile(loss='binary_crossentropy', optimizer='adadelta', class_mode='binary')
+
+            self.model_config['dropout'] = [0.5,0.5]
+
+        def lstm_5():
+            model = Sequential()
+            model.add(LSTM(input_dim=32, output_dim=64, return_sequences=False)) # try using a GRU instead, for fun
+            model.add(Dropout(0.5))
+            model.add(Dense(64, len(self.event_list)))
+            model.add(Activation('sigmoid'))
+            model.compile(loss='binary_crossentropy', optimizer='adadelta', class_mode='binary')
+            self.model_config['dropout'] = [0.5]
+
             return model
 
         def simple_rnn_1():
             model = Sequential()
-            model.add(SimpleDeepRNN(input_dim=32, output_dim=64)) # try using a GRU instead, for fun
+            model.add(SimpleRNN(input_dim=32, output_dim=64)) # try using a GRU instead, for fun
             # model.add(Dropout(0.5))
             model.add(Dense(64, len(self.event_list)))
+            model.add(Activation('sigmoid'))
+            model.compile(loss='binary_crossentropy', optimizer='adadelta', class_mode='binary')
+            return model
+
+        def simple_rnn_2():
+            self.model_config['dropout'] = [0.0,0.0]
+            model = Sequential()
+            model.add(SimpleRNN(input_dim=32, output_dim=64, return_sequences = True))
+            model.add(SimpleRNN(input_dim=64, output_dim=64, return_sequences = False))
+            model.add(Dropout(0.0))
+            model.add(Dense(64, 128))
+            model.add(Dropout(0.0))
+            model.add(Dense(128, len(self.event_list)))
             model.add(Activation('sigmoid'))
             model.compile(loss='binary_crossentropy', optimizer='adadelta', class_mode='binary')
             return model
@@ -654,6 +1132,139 @@ class EEG_rnn_batch():
             model.compile(loss='mean_squared_error', optimizer='adadelta')
             return model
 
+        def simple_rnn_softmax():
+            model = Sequential()
+            model.add(SimpleRNN(input_dim=32, output_dim=32)) # try using a GRU instead, for fun
+            # model.add(Dropout(0.5))
+            model.add(Dense(32, len(self.event_list)))
+            model.add(Activation('softmax'))
+            model.compile(loss='categorical_crossentropy', optimizer='adadelta', class_mode='categorical')
+            return model
+
+        def simple_rnn_softmax_2():
+            model = Sequential()
+            model.add(SimpleRNN(input_dim=32, output_dim=16)) # try using a GRU instead, for fun
+            # model.add(Dropout(0.5))
+            model.add(Dense(16, len(self.event_list)))
+            model.add(Activation('softmax'))
+            model.compile(loss='categorical_crossentropy', optimizer='adadelta', class_mode='categorical')
+            return model
+
+        def gru_softmax():
+            model = Sequential()
+            model.add(GRU(input_dim=32, output_dim=32)) # try using a GRU instead, for fun
+            # model.add(Dropout(0.5))
+            model.add(Dense(32, len(self.event_list)))
+            model.add(Activation('softmax'))
+            model.compile(loss='categorical_crossentropy', optimizer='adam', class_mode='categorical')
+            return model
+
+        def lstm_softmax():
+            model = Sequential()
+            model.add(LSTM(input_dim=32, output_dim=32, return_sequences=False)) # try using a GRU instead, for fun
+            model.add(Dropout(0.5))
+            model.add(Dense(32, len(self.event_list)))
+            model.add(Activation('softmax'))
+            model.compile(loss='categorical_crossentropy', optimizer='adadelta', class_mode = 'categorical')
+            self.model_config['dropout'] = [0.5]
+            return model
+
+        def lstm_softmax_2():
+            model = Sequential()
+            model.add(LSTM(input_dim=32, output_dim=64, return_sequences=False)) # try using a GRU instead, for fun
+            model.add(Dropout(0.0))
+            model.add(Dense(64, len(self.event_list)))
+            model.add(Activation('softmax'))
+            model.compile(loss='categorical_crossentropy', optimizer='adadelta', class_mode = 'categorical')
+            return model
+
+        def lstm_softmax_3():
+            model = Sequential()
+            model.add(LSTM(input_dim=32, output_dim=32, return_sequences=False)) # try using a GRU instead, for fun
+            model.add(Dropout(0.0))
+            model.add(Dense(32, 32))
+            model.add(Activation('relu'))
+            model.add(Dense(32, len(self.event_list)))
+            model.add(Activation('softmax'))
+            model.compile(loss='categorical_crossentropy', optimizer='adadelta', class_mode = 'categorical')
+            return model
+
+        def lstm_softmax_4():
+            model = Sequential()
+            model.add(LSTM(input_dim=32, output_dim=32, return_sequences=True)) # try using a GRU instead, for fun
+            model.add(LSTM(input_dim=32, output_dim=32, return_sequences=False)) # try using a GRU instead, for fun
+            model.add(Dropout(0.0))
+            model.add(Dense(32, 32))
+            model.add(Activation('relu'))
+            model.add(Dropout(0.0))
+            model.add(Dense(32, len(self.event_list)))
+            model.add(Activation('softmax'))
+            model.compile(loss='categorical_crossentropy', optimizer='adadelta', class_mode = 'categorical')
+            return model
+
+        def lstm_softmax_5():
+            self.model_config['dropout'] = 0.5
+            model = Sequential()
+            model.add(LSTM(input_dim=32, output_dim=32, return_sequences=True)) # try using a GRU instead, for fun
+            model.add(LSTM(input_dim=32, output_dim=16, return_sequences=False)) # try using a GRU instead, for fun
+            model.add(Dropout(0.5))
+            model.add(Dense(16, len(self.event_list)))
+            model.add(Activation('softmax'))
+            model.compile(loss='categorical_crossentropy', optimizer='adadelta', class_mode = 'categorical')
+            return model
+
+        def gru_softmax_5():
+            self.model_config['dropout'] = 0.0
+            model = Sequential()
+            model.add(GRU(input_dim=32, output_dim=32, return_sequences=True)) # try using a GRU instead, for fun
+            model.add(GRU(input_dim=32, output_dim=16, return_sequences=False)) # try using a GRU instead, for fun
+            model.add(Dropout(0.50))
+            model.add(Dense(16, len(self.event_list)))
+            model.add(Activation('softmax'))
+            model.compile(loss='categorical_crossentropy', optimizer='adadelta', class_mode = 'categorical')
+            return model
+
+        def jzs1_softmax_5():
+            self.model_config['dropout'] = 0.0
+            model = Sequential()
+            model.add(JZS1(input_dim=32, output_dim=32, return_sequences=True)) # try using a GRU instead, for fun
+            model.add(JZS1(input_dim=32, output_dim=16, return_sequences=False)) # try using a GRU instead, for fun
+            model.add(Dropout(0.50))
+            model.add(Dense(16, len(self.event_list)))
+            model.add(Activation('softmax'))
+            model.compile(loss='categorical_crossentropy', optimizer='adadelta', class_mode = 'categorical')
+            return model
+        def jzs2_softmax_5():
+
+            self.model_config['dropout'] = 0.0
+            model = Sequential()
+            model.add(JZS2(input_dim=32, output_dim=32, return_sequences=True)) # try using a GRU instead, for fun
+            model.add(JZS2(input_dim=32, output_dim=16, return_sequences=False)) # try using a GRU instead, for fun
+            model.add(Dropout(0.50))
+            model.add(Dense(16, len(self.event_list)))
+            model.add(Activation('softmax'))
+            model.compile(loss='categorical_crossentropy', optimizer='adadelta', class_mode = 'categorical')
+            return model
+
+        def jzs3_softmax_5():
+
+            self.model_config['dropout'] = 0.5
+            model = Sequential()
+            model.add(JZS3(input_dim=32, output_dim=32, return_sequences=True)) # try using a GRU instead, for fun
+            model.add(JZS3(input_dim=32, output_dim=32, return_sequences=False)) # try using a GRU instead, for fun
+            model.add(Dropout(0.50))
+            model.add(Dense(32 , len(self.event_list)))
+            model.add(Activation('softmax'))
+            model.compile(loss='categorical_crossentropy', optimizer='adadelta', class_mode = 'categorical')
+            return model
+
+        def simple_softmax(timesteps):
+            model = Sequential()
+            model.add(Dense(input = 32 * timesteps, output_dim = 1))
+            model.add(Activation('softmax'))
+            model.compile(loss='categorical_crossentropy', optimizer='adadelta', class_mode='categorical')
+            return model
+
         self.model = eval('{0}()'.format(model_name))
         self.model_config['model'] = model_name
         self.logger.info('selected model {0}'.format(model_name))
@@ -675,17 +1286,23 @@ class EEG_rnn_batch():
             auc_total = 0
             for i in data_list:
                 X, y = generator.next()
-                loss, accuracy = self.model.train_on_batch(X = X, y = y, accuracy = True)
-                loss_total = loss_total + loss
-                accuracy_total = accuracy_total + accuracy
+                if data_type == 'train':
+                    loss, accuracy = self.model.train_on_batch(X = X, y = y, accuracy = True)
+                    loss_total = loss_total + loss
+                    accuracy_total = accuracy_total + accuracy
+                    print( '{0} : complete {1:.2f}%,  loss : {2}'.format(data_type, float(i+1)/len(data_list) * 100, loss_total/(i+1)), end = '\r')
                 if data_type == 'test' or data_type == 'validate':
                     pred = self.model.predict(X)
+                    temp_loss_total = 0
+                    for j in range(y.shape[1]):
+                        temp_loss = sklearn.metrics.log_loss(y[:,j], pred[:,j])
+                        temp_loss_total = temp_loss_total + temp_loss
+                    temp_loss_total = temp_loss_total / y.shape[1]
+                    loss_total = loss_total + temp_loss_total
                     auc = np.asarray([roc_auc_score(y[:, j], pred[:, j]) for j in range(y.shape[1])])
                     auc_total = auc_total + auc
                     mean_auc_total = np.mean(auc_total)
                     print( '{0} : complete {1:.2f}%,  loss : {2}, auc : {3}'.format(data_type, float(i+1)/len(data_list) * 100, loss_total/(i+1), mean_auc_total/(i+1)), end = '\r')
-                elif data_type == 'train':
-                    print( '{0} : complete {1:.2f}%,  loss : {2}'.format(data_type, float(i+1)/len(data_list) * 100, loss_total/(i+1)), end = '\r')
 
             if data_type == 'test' or data_type == 'validate':
                 self.logger.info( '{0} : complete {1:.2f}%,  loss : {2}, auc : {3}'.format(data_type, float(i+1)/len(data_list) * 100, loss_total/(i+1), mean_auc_total/(i+1)))
@@ -697,12 +1314,45 @@ class EEG_rnn_batch():
         run(data_list = validate_list, data_type='validate')
         run(data_list=test_list, data_type= 'test')
 
-    def run_model_event(self, data, nb_epoch):
+    def run_model_with_generator_event_classify(self, generator, train_list, validate_list, test_list):
+
+        self.model_config['train_data_size'] = len(train_list)
+        self.model_config['validate_data_size'] = len(validate_list)
+        self.model_config['test_data_size'] = len(test_list)
+
+        def run(data_list, data_type, generator=generator):
+            loss_total = 0
+            accuracy_total = 0
+            for i in data_list:
+                X, y = generator.next()
+                if data_type == 'train':
+                    loss, accuracy = self.model.train_on_batch(X = X, y = y, accuracy = True)
+                    loss_total = loss_total + loss
+                    accuracy_total = accuracy_total + accuracy
+                    print( '{0} : complete {1:.2f}%,  loss : {2}, accuracy : {3}'.format(data_type, float(i+1)/len(data_list) * 100, loss_total/(i+1), accuracy_total/(i+1)), end = '\r')
+                if data_type == 'test' or data_type == 'validate':
+                    loss, accuracy = self.model.test_on_batch(X = X, y = y, accuracy = True)
+                    loss_total = loss_total + loss
+                    accuracy_total = accuracy_total + accuracy
+                    print( '{0} : complete {1:.2f}%,  loss : {2}, accuracy : {3}'.format(data_type, float(i+1)/len(data_list) * 100, loss_total/(i+1), accuracy_total/(i+1)), end = '\r')
+
+            if data_type == 'test' or data_type == 'validate':
+                self.logger.info( '{0} : complete {1:.2f}%,  loss : {2}, accuracy : {3}'.format(data_type, float(i+1)/len(data_list) * 100, loss_total/(i+1), accuracy_total/(i+1)))
+
+            elif data_type == 'train':
+                self.logger.info( '{0} : complete {1:.2f}%,  loss : {2}, accuracy : {3}'.format(data_type, float(i+1)/len(data_list) * 100, loss_total/(i+1), accuracy_total/(i+1)))
+
+        run(data_list=train_list, data_type = 'train')
+        run(data_list = validate_list, data_type='validate')
+        run(data_list=test_list, data_type= 'test')
+
+    def run_model_event(self, data, nb_epoch, batch_size):
         [train_X, train_y, val_X, val_y, test_X, test_y] = data
-        loss_train = self.model.fit(X=train_X, y=train_y, show_accuracy=True, nb_epoch = nb_epoch)
-        loss_val = self.model.fit(X=val_X, y=val_y, show_accuracy=True, nb_epoch = nb_epoch)
-        loss_test = self.model.fit(X=test_X, y=test_y, show_accuracy=True, nb_epoch = nb_epoch)
-        return loss_train, loss_val, loss_test
+        print('train')
+        loss_train = self.model.fit(X=train_X, y=train_y, show_accuracy=True, nb_epoch = nb_epoch, validation_data = (val_X, val_y), batch_size=batch_size)
+        print('test')
+        loss_test = self.model.evaluate(X=test_X, y=test_y, show_accuracy=True)
+        return loss_train, loss_test
 
     def run_model_with_generator_kin(self, generator, train_list, test_list):
 
@@ -806,8 +1456,8 @@ class EEG_rnn_batch():
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        validate_score, param_threshold_list = evaluate_score_revised(self, validate_list, 'validate')
         train_score, _ = evaluate_score_revised(self, train_list, 'train')
+        validate_score, param_threshold_list = evaluate_score_revised(self, validate_list, 'validate')
         test_score, _ = evaluate_score_revised(self, test_list, 'test', param_threshold_list=param_threshold_list)
 
         validate_score.to_csv(os.path.join(output_dir, 'validate_score.csv'))
@@ -817,6 +1467,197 @@ class EEG_rnn_batch():
         self.model.save_weights(os.path.join(output_dir, 'weight.hdf'))
 
         self.model_config['threshold'] = param_threshold_list
+        with open(os.path.join(output_dir, 'data_description.txt'), 'w') as f:
+            for key in self.data_description.keys():
+                f.write('{0} : {1}\n'.format(key, self.data_description[key]))
+
+        self.logger.info('data_description.txt saved')
+
+        with open(os.path.join(output_dir, 'model_config.txt'), 'w') as f:
+            for key in self.model_config.keys():
+                if isinstance(self.model_config[key], collections.Iterable) and not isinstance(self.model_config[key], basestring):
+                    self.model_config[key] = ', '.join([str(i) for i in self.model_config[key]])
+                f.write('{0} : {1}\n'.format(key, self.model_config[key]))
+        self.logger.info('model_config.txt saved')
+
+    def save_event_generator_classify(self, generator, train_list, validate_list, test_list, event_list, output_dir):
+        assert self.data_description != None, 'data_description is not set'
+
+        def evaluate_score_revised(self, data_list, data_type, generator=generator, event_list=event_list, output_dir = output_dir):
+            self.logger.info('predicting values : {0}'.format(data_type))
+
+            pred = None
+            for _ in data_list:
+                X , y_temp = generator.next()
+                pred_temp = np.expand_dims(self.model.predict_classes(X, verbose=False), axis=1)
+
+
+                if pred == None:
+                    pred = pred_temp
+                    y = np.zeros((y_temp.shape[0],1))
+                    for i in range(y_temp.shape[1]):
+                        y[np.where(y_temp[:,i] == 1)] = i
+                else:
+
+                    pred = np.vstack((pred, pred_temp))
+
+                    y_temp_categorize = np.zeros((y_temp.shape[0], 1))
+                    for i in range(y_temp.shape[1]):
+                        y_temp_categorize[np.where(y_temp[:,i] == 1)] = i
+                    y = np.vstack((y, y_temp_categorize))
+
+            cm = confusion_matrix(y, pred)
+            cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+
+            cm_df = pd.DataFrame(data = cm_normalized, columns=event_list, index=event_list)
+
+            return cm_df, accuracy_score(y, pred), np.hstack((y, pred))
+
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        train_confmat, train_acc, train_y_pred = evaluate_score_revised(self, train_list, 'train')
+        validate_confmat, validate_acc, validate_y_pred = evaluate_score_revised(self, validate_list, 'validate')
+        test_confmat, test_acc, test_y_pred = evaluate_score_revised(self, test_list, 'test')
+
+        train_confmat.to_csv(os.path.join(output_dir, 'train_confusion_matrix.csv'))
+        validate_confmat.to_csv(os.path.join(output_dir, 'validate_confusion_matrix.csv'))
+        test_confmat.to_csv(os.path.join(output_dir, 'test_confusion_matrix.csv'))
+
+        np.savetxt(os.path.join(output_dir, 'train_y_pred.txt'), train_y_pred, fmt = '%d', delimiter=',')
+        np.savetxt(os.path.join(output_dir, 'validate_y_pred.txt'), validate_y_pred, fmt = '%d', delimiter =',')
+        np.savetxt(os.path.join(output_dir, 'test_y_pred.txt'), test_y_pred, fmt = '%d', delimiter=',')
+
+        with open(os.path.join(output_dir, 'accuracy_score.txt'), 'w') as f:
+            f.write('train accuracy : {}'.format(train_acc))
+            f.write('validate accuracy : {}'.format(validate_acc))
+            f.write('test accuracy : {}'.format(test_acc))
+
+        self.model.save_weights(os.path.join(output_dir, 'weight.hdf'))
+
+        self.model_config['threshold'] = 'None'
+        with open(os.path.join(output_dir, 'data_description.txt'), 'w') as f:
+            for key in self.data_description.keys():
+                f.write('{0} : {1}\n'.format(key, self.data_description[key]))
+
+        self.logger.info('data_description.txt saved')
+
+        with open(os.path.join(output_dir, 'model_config.txt'), 'w') as f:
+            for key in self.model_config.keys():
+                if isinstance(self.model_config[key], collections.Iterable) and not isinstance(self.model_config[key], basestring):
+                    self.model_config[key] = ', '.join([str(i) for i in self.model_config[key]])
+                f.write('{0} : {1}\n'.format(key, self.model_config[key]))
+        self.logger.info('model_config.txt saved')
+
+    def save_event_classify(self, data, event_list, output_dir):
+        assert self.data_description != None, 'data_description is not set'
+
+        def evaluate_score_revised(self, data, data_type, param_window=0, event_list=event_list, output_dir = output_dir):
+            self.logger.info('predicting values : {0}'.format(data_type))
+
+            [X, temp_y] = data
+
+            y = np.zeros((temp_y.shape[0], 1))
+            pred = np.expand_dims(self.model.predict_classes(X, verbose=False), axis=1)
+
+            def mean_prediction(pred_proba, window):
+                ave_pred = np.zeros(pred_proba.shape[0])
+                for i in np.arange(1, pred_proba.shape[0], dtype=int):
+                    if i < window:
+                        ave_pred[i] = np.argmax(np.mean(pred_proba[:i], axis = 0))
+                    else:
+                        ave_pred[i] = np.argmax(np.mean(pred_proba[i-window/2:i+window/2], axis = 0))
+                return ave_pred
+
+            for i in range(temp_y.shape[1]):
+                y[np.where(temp_y[:,i] == 1)] = i
+
+
+            pred_proba = self.model.predict(X, verbose=False)
+            pred = self.model.predict_classes(X, verbose=False)
+            best_score = 0
+            best_window = 10
+
+            if data_type == 'validate':
+                for window in np.arange(10, 50, step=5):
+                    ave_pred = mean_prediction(pred_proba, window=window)
+                    temp_score = accuracy_score(y, ave_pred)
+                    if temp_score > best_score:
+                        best_score = temp_score
+                        best_window = window
+                        best_ave_pred = ave_pred
+            else:
+                best_ave_pred = mean_prediction(pred_proba, window=param_window)
+                best_score = accuracy_score(y, best_ave_pred)
+
+            score = accuracy_score(y, pred)
+            non_smoothed_cm = confusion_matrix(y, pred)
+            non_smoothed_cm_normalized = non_smoothed_cm.astype('float') / non_smoothed_cm.sum(axis=1)[:, np.newaxis]
+
+            non_smoothed_cm_df = pd.DataFrame(data = non_smoothed_cm, columns=event_list, index=event_list)
+            non_smoothed_n_cm_df = pd.DataFrame(data = non_smoothed_cm_normalized, columns=event_list, index=event_list)
+
+            cm = confusion_matrix(y, best_ave_pred)
+            cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+
+            cm_df = pd.DataFrame(data = cm, columns=event_list, index=event_list)
+            n_cm_df = pd.DataFrame(data = cm_normalized, columns=event_list, index=event_list)
+
+
+            new_pred = np.hstack((y, np.expand_dims(best_ave_pred, axis=1)))
+            pred_total = np.hstack((new_pred, pred.reshape(pred.shape[0],1)))
+
+            return n_cm_df, cm_df, best_score, non_smoothed_n_cm_df, non_smoothed_cm_df, score, best_window, pd.DataFrame(pred_total, columns=['True', 'Predict', 'Non-smoothed'])
+
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        [train_X, train_y, val_X, val_y, test_X, test_y] = data
+
+
+        validate_n_confmat, validate_confmat, validate_acc, validate_n_confmat_non, validate_confmat_non, validate_acc_non, best_window, valid_pred = evaluate_score_revised(self, [val_X, val_y], 'validate')
+        train_n_confmat, train_confmat, train_acc, train_n_confmat_non, train_confmat_non, train_acc_non,_, train_pred = evaluate_score_revised(self, [train_X, train_y], 'train', param_window=best_window)
+        test_n_confmat, test_confmat, test_acc, test_n_confmat_non, test_confmat_non, test_acc_non,_, test_pred = evaluate_score_revised(self, [test_X, test_y], 'test', param_window=best_window)
+
+
+        self.model_config['window_size'] = best_window
+
+        train_n_confmat.to_csv(os.path.join(output_dir, 'normalized_train_confusion_matrix.csv'))
+        validate_n_confmat.to_csv(os.path.join(output_dir, 'normalized_validate_confusion_matrix.csv'))
+        test_n_confmat.to_csv(os.path.join(output_dir, 'normalized_test_confusion_matrix.csv'))
+
+        train_confmat.to_csv(os.path.join(output_dir, 'train_confusion_matrix.csv'))
+        validate_confmat.to_csv(os.path.join(output_dir, 'validate_confusion_matrix.csv'))
+        test_confmat.to_csv(os.path.join(output_dir, 'test_confusion_matrix.csv'))
+
+        train_n_confmat_non.to_csv(os.path.join(output_dir, 'non_normalized_train_confusion_matrix.csv'))
+        validate_n_confmat_non.to_csv(os.path.join(output_dir, 'non_normalized_validate_confusion_matrix.csv'))
+        test_n_confmat_non.to_csv(os.path.join(output_dir, 'non_normalized_test_confusion_matrix.csv'))
+
+        train_confmat_non.to_csv(os.path.join(output_dir, 'non_train_confusion_matrix.csv'))
+        validate_confmat_non.to_csv(os.path.join(output_dir, 'non_validate_confusion_matrix.csv'))
+        test_confmat_non.to_csv(os.path.join(output_dir, 'non_test_confusion_matrix.csv'))
+
+        train_pred.to_csv(os.path.join(output_dir, 'train_pred.csv'))
+        valid_pred.to_csv(os.path.join(output_dir, 'validate_pred.csv'))
+        test_pred.to_csv(os.path.join(output_dir, 'test_pred.csv'))
+
+        # np.savetxt(os.path.join(output_dir, 'train_y_pred.txt'), train_y_pred, fmt = '%d', delimiter=',')
+        # np.savetxt(os.path.join(output_dir, 'validate_y_pred.txt'), validate_y_pred, fmt = '%d', delimiter =',')
+        # np.savetxt(os.path.join(output_dir, 'test_y_pred.txt'), test_y_pred, fmt = '%d', delimiter=',')
+
+        with open(os.path.join(output_dir, 'accuracy_score.txt'), 'w') as f:
+            f.write('train accuracy : {}'.format(train_acc))
+            f.write('validate accuracy : {}'.format(validate_acc))
+            f.write('test accuracy : {}'.format(test_acc))
+
+            f.write('non-smoothed train accuracy : {}'.format(train_acc_non))
+            f.write('non-smoothed validate accuracy : {}'.format(validate_acc_non))
+            f.write('non-smoothed test accuracy : {}'.format(test_acc_non))
+
+        self.model.save_weights(os.path.join(output_dir, 'weight.hdf'))
+
+        self.model_config['threshold'] = 'None'
         with open(os.path.join(output_dir, 'data_description.txt'), 'w') as f:
             for key in self.data_description.keys():
                 f.write('{0} : {1}\n'.format(key, self.data_description[key]))
@@ -974,5 +1815,6 @@ class EEG_rnn_batch():
 
     def set_logger(self, logger):
         self.logger = logger
+
 
 
